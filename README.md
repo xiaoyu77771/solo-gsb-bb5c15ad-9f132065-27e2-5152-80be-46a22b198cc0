@@ -12,6 +12,7 @@ docker compose up --build -d
 
 - 健康检查：`http://localhost:3000/health`
 - 解析接口：`http://localhost:3000/resolve`
+- 升级计划接口：`http://localhost:3000/update-plan`
 
 停止服务：
 
@@ -98,6 +99,58 @@ curl -s -X POST http://localhost:3000/resolve \
 
 `plan` 包含所有根依赖及传递依赖，每个包只选择一个满足全部约束的版本。
 
+### `POST /update-plan`
+
+在 `/resolve` 的约束求解之上，结合当前锁定版本计算最小变更的升级计划。
+
+请求体在 `/resolve` 的基础上增加两个字段：
+
+- `locked`：当前锁定的“包名 → 版本”。版本号按与 registry 相同的规则做 semver 规范化（如 `v1.0.0` 视为 `1.0.0`）；不在 registry 中的锁定包视为将被移除。
+- `update`：额外的根级升级约束，“包名 → semver 范围”，与 `root` 及传递依赖约束取交集（必须同时满足）。
+
+求解目标（按优先级）：
+
+1. 在满足全部 semver 约束的可行解中，最小化相对 `locked` 的变更包数量；新增、删除、换版各计一次。
+2. 变更数相同时，按包名字典序逐项比较，优先选择更高版本；仅在一方计划中出现的包优先于缺失。相同输入始终产生相同结果。
+
+示例：
+
+```bash
+curl -s -X POST http://localhost:3000/update-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "registry": {
+      "app": { "1.0.0": { "dependencies": { "lib": ">=1.0.0" } } },
+      "lib": { "2.0.0": {}, "1.0.0": {} }
+    },
+    "root": { "app": "1.0.0" },
+    "locked": { "app": "1.0.0", "lib": "1.0.0" },
+    "update": { "lib": "^2.0.0" }
+  }'
+```
+
+成功时返回 `200`：
+
+```json
+{
+  "satisfiable": true,
+  "plan": [
+    { "package": "app", "version": "1.0.0" },
+    { "package": "lib", "version": "2.0.0" }
+  ],
+  "summary": {
+    "kept": [
+      { "package": "app", "version": "1.0.0" }
+    ],
+    "changed": [
+      { "package": "lib", "from": "1.0.0", "to": "2.0.0" }
+    ]
+  }
+}
+```
+
+`summary.kept` 为保持不变的包；`summary.changed` 按包名排序，`from` 为 `null` 表示新增包，`to` 为 `null` 表示移除包，其余为版本变更。无解时返回与 `/resolve` 相同的 `409` 冲突结构；`locked` 版本或 `update` 范围非法时返回 `400`。
+
 ## 解析与稳定性规则
 
 1. 待解析包按包名字典序选择。
@@ -114,7 +167,7 @@ curl -s -X POST http://localhost:3000/resolve \
 
 ## 冲突响应
 
-不存在满足全部约束的安装计划时返回 `409 Conflict`。`conflict.chain` 从根依赖开始，沿搜索过程中首个无候选包的引入路径展开，并列出：
+不存在满足全部约束的安装计划时返回 `409 Conflict`（`/resolve` 与 `/update-plan` 结构相同）。`conflict.chain` 从根依赖开始，沿搜索过程中首个无候选包的引入路径展开，并列出：
 
 - 每个沿途包已选定的版本；
 - 该节点收到的 semver 约束；
@@ -170,7 +223,7 @@ curl -s -X POST http://localhost:3000/resolve \
 - `NO_VERSION_SATISFIES_CONSTRAINTS`：包存在，但没有版本同时满足全部约束。
 - `SELECTED_VERSION_DOES_NOT_SATISFY_CONSTRAINT`：新依赖约束与当前分支已选定版本冲突；该分支随后回溯。
 
-非法 JSON、无效 semver、错误的数据类型返回 `400 Bad Request`。
+非法 JSON、无效 semver（含 `locked` 版本与 `update` 范围）、错误的数据类型返回 `400 Bad Request`。
 
 ## 本地开发
 

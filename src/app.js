@@ -1,7 +1,7 @@
 'use strict';
 
 const express = require('express');
-const { resolve, ResolutionError } = require('./resolver');
+const { planUpdate, resolve, ResolutionError } = require('./resolver');
 
 function createApp() {
   const app = express();
@@ -20,6 +20,18 @@ function createApp() {
   app.post('/resolve', (req, res, next) => {
     try {
       const result = resolve(req.body);
+      if (result.satisfiable) {
+        return res.json(result);
+      }
+      return res.status(409).json(result);
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.post('/update-plan', (req, res, next) => {
+    try {
+      const result = planUpdate(req.body);
       if (result.satisfiable) {
         return res.json(result);
       }

@@ -44,21 +44,12 @@ function comparePathNodes(a, b) {
 }
 
 /**
- * Convert and validate the request body into Maps that do not retain the
- * caller's object insertion order.
+ * Convert and validate the registry object into a Map that does not retain
+ * the caller's object insertion order.
  */
-function normalizeInput(input) {
-  if (!isPlainObject(input)) {
-    throw new ResolutionError('The request body must be a JSON object.');
-  }
-
-  const { registry, root } = input;
-
+function normalizeRegistry(registry) {
   if (!isPlainObject(registry)) {
     throw new ResolutionError('registry must be an object mapping package names to versions.');
-  }
-  if (!isPlainObject(root)) {
-    throw new ResolutionError('root must be an object mapping dependency names to semver ranges.');
   }
 
   const catalog = new Map();
@@ -129,17 +120,80 @@ function normalizeInput(input) {
     catalog.set(packageName, versionEntries);
   }
 
-  const rootRequirements = new Map();
-  for (const packageName of Object.keys(root).sort()) {
-    assertNonEmptyName(packageName, 'root');
-    const range = root[packageName];
-    if (typeof range !== 'string' || semver.validRange(range) === null) {
-      throw new ResolutionError(`root.${packageName} must be a valid semver range string.`);
-    }
-    rootRequirements.set(packageName, range);
+  return catalog;
+}
+
+/**
+ * Convert and validate a "package name -> semver range" object (root
+ * requirements or update constraints) into a sorted-name Map.
+ */
+function normalizeRequirements(requirements, location) {
+  if (!isPlainObject(requirements)) {
+    throw new ResolutionError(`${location} must be an object mapping dependency names to semver ranges.`);
   }
 
-  return { catalog, rootRequirements };
+  const result = new Map();
+  for (const packageName of Object.keys(requirements).sort()) {
+    assertNonEmptyName(packageName, location);
+    const range = requirements[packageName];
+    if (typeof range !== 'string' || semver.validRange(range) === null) {
+      throw new ResolutionError(`${location}.${packageName} must be a valid semver range string.`);
+    }
+    result.set(packageName, range);
+  }
+  return result;
+}
+
+/**
+ * Convert and validate the locked "package name -> version" map, applying
+ * the same semver canonicalization as registry versions.
+ */
+function normalizeLocked(locked) {
+  if (!isPlainObject(locked)) {
+    throw new ResolutionError('locked must be an object mapping package names to locked versions.');
+  }
+
+  const result = new Map();
+  for (const packageName of Object.keys(locked).sort()) {
+    assertNonEmptyName(packageName, 'locked');
+    const version = locked[packageName];
+    if (typeof version !== 'string' || !semver.valid(version)) {
+      throw new ResolutionError(`locked.${packageName} must be a valid semver version string.`);
+    }
+    result.set(packageName, semver.parse(version).version);
+  }
+  return result;
+}
+
+/**
+ * Convert and validate the request body into Maps that do not retain the
+ * caller's object insertion order.
+ */
+function normalizeInput(input) {
+  if (!isPlainObject(input)) {
+    throw new ResolutionError('The request body must be a JSON object.');
+  }
+
+  return {
+    catalog: normalizeRegistry(input.registry),
+    rootRequirements: normalizeRequirements(input.root, 'root'),
+  };
+}
+
+/**
+ * Convert and validate an /update-plan request body.
+ */
+function normalizeUpdatePlanInput(input) {
+  if (!isPlainObject(input)) {
+    throw new ResolutionError('The request body must be a JSON object.');
+  }
+
+  return {
+    catalog: normalizeRegistry(input.registry),
+    rootRequirements: normalizeRequirements(input.root, 'root'),
+    updateRequirements: normalizeRequirements(input.update, 'update'),
+    locked: normalizeLocked(input.locked),
+  };
 }
 
 function serializeSource(source) {
@@ -197,14 +251,22 @@ function choosePrimaryConstraint(entries, chains) {
     const best = chains[bestIndex];
     const current = chains[i];
 
-    if (
-      current.length > best.length ||
-      (current.length === best.length && comparePathNodes(
-        current[current.length - 1] || {},
-        best[best.length - 1] || {}
-      ) < 0)
-    ) {
+    if (current.length > best.length) {
       bestIndex = i;
+      continue;
+    }
+
+    if (current.length === best.length) {
+      // Seeded root/update requirements have empty chains and no path nodes
+      // to compare; fall back to the constraint itself so the choice stays
+      // deterministic.
+      const comparison = current.length === 0
+        ? compareConstraints(entries[i], entries[bestIndex])
+        : comparePathNodes(current[current.length - 1], best[best.length - 1]);
+
+      if (comparison < 0) {
+        bestIndex = i;
+      }
     }
   }
 
@@ -265,16 +327,44 @@ function satisfiesAll(version, constraints) {
   return constraints.every(({ range }) => semver.satisfies(version, range));
 }
 
-function solve({ catalog, rootRequirements }) {
+function comparePackageNames(a, b) {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function buildPlan(selected) {
+  return [...selected.entries()]
+    .sort((a, b) => comparePackageNames(a[0], b[0]))
+    .map(([name, entry]) => ({
+      package: name,
+      version: entry.version,
+    }));
+}
+
+function rootSeed(requirements) {
+  return [...requirements.entries()]
+    .sort((a, b) => comparePackageNames(a[0], b[0]))
+    .map(([name, range]) => ({ name, range, source: { ...ROOT_SOURCE } }));
+}
+
+/**
+ * Depth-first backtracking search shared by /resolve and /update-plan.
+ * `visit(state)` is called for every complete assignment in deterministic
+ * search order; any truthy return value stops the search and is propagated
+ * to the caller. `prune(state)` may skip branches that cannot improve the
+ * best solution found so far.
+ */
+function createSearch({ catalog, seed }) {
   const constraints = new Map();
   const reasons = new Map();
 
-  // Root requirements are inserted in sorted package-name order.
-  for (const [name, range] of [...rootRequirements.entries()].sort((a, b) =>
-    a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0
-  )) {
-    constraints.set(name, [{ range, source: { ...ROOT_SOURCE } }]);
-    reasons.set(name, [[]]);
+  // Seed requirements are inserted in sorted package-name order.
+  for (const { name, range, source } of seed) {
+    if (!constraints.has(name)) {
+      constraints.set(name, []);
+      reasons.set(name, []);
+    }
+    constraints.get(name).push({ range, source: { ...source } });
+    reasons.get(name).push([]);
   }
 
   const initialState = { constraints, reasons, selected: new Map() };
@@ -282,21 +372,15 @@ function solve({ catalog, rootRequirements }) {
 
   function recordConflict(conflict) {
     if (firstConflict === null) firstConflict = conflict;
-    return null;
   }
 
-  function dfs(state) {
+  function dfs(state, visit, prune) {
     const unresolved = [...state.constraints.keys()]
       .filter((name) => !state.selected.has(name))
       .sort();
 
     if (unresolved.length === 0) {
-      return [...state.selected.entries()]
-        .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
-        .map(([name, entry]) => ({
-          package: name,
-          version: entry.version,
-        }));
+      return visit(state);
     }
 
     const target = unresolved[0];
@@ -310,7 +394,8 @@ function solve({ catalog, rootRequirements }) {
       const reasonCode = availableVersions.length === 0
         ? 'PACKAGE_NOT_IN_REGISTRY'
         : 'NO_VERSION_SATISFIES_CONSTRAINTS';
-      return recordConflict(buildConflict(target, state, reasonCode, catalog));
+      recordConflict(buildConflict(target, state, reasonCode, catalog));
+      return null;
     }
 
     for (const candidate of candidates) {
@@ -386,14 +471,27 @@ function solve({ catalog, rootRequirements }) {
         selected: nextSelected,
       };
 
-      const solution = dfs(nextState);
-      if (solution) return solution;
+      if (prune && prune(nextState)) {
+        continue;
+      }
+
+      const result = dfs(nextState, visit, prune);
+      if (result) return result;
     }
 
     return null;
   }
 
-  const plan = dfs(initialState);
+  return {
+    initialState,
+    dfs,
+    getFirstConflict: () => firstConflict,
+  };
+}
+
+function solve({ catalog, rootRequirements }) {
+  const search = createSearch({ catalog, seed: rootSeed(rootRequirements) });
+  const plan = search.dfs(search.initialState, (state) => buildPlan(state.selected), null);
 
   if (plan) {
     return {
@@ -402,16 +500,143 @@ function solve({ catalog, rootRequirements }) {
     };
   }
 
-  return firstConflict;
+  return search.getFirstConflict();
+}
+
+/**
+ * Number of already-selected packages that are new or version-changed
+ * relative to the locked map. This only grows as the search selects more
+ * packages, so it is a safe lower bound for pruning.
+ */
+function countSelectedChanges(selected, locked) {
+  let changes = 0;
+  for (const [name, entry] of selected) {
+    if (locked.get(name) !== entry.version) {
+      changes += 1;
+    }
+  }
+  return changes;
+}
+
+/**
+ * Total number of changed packages in a complete plan: additions, removals
+ * and version changes each count once.
+ */
+function countTotalChanges(selected, locked) {
+  let changes = countSelectedChanges(selected, locked);
+  for (const name of locked.keys()) {
+    if (!selected.has(name)) {
+      changes += 1;
+    }
+  }
+  return changes;
+}
+
+/**
+ * Tie-break between two complete plans with equal change counts: walk
+ * package names in lexicographic order and prefer the higher version at
+ * the first differing name. A package present in only one plan is
+ * preferred over its absence.
+ */
+function comparePlans(a, b) {
+  const versionsA = new Map(a.map((entry) => [entry.package, entry.version]));
+  const versionsB = new Map(b.map((entry) => [entry.package, entry.version]));
+  const names = [...new Set([...versionsA.keys(), ...versionsB.keys()])].sort();
+
+  for (const name of names) {
+    const versionA = versionsA.get(name);
+    const versionB = versionsB.get(name);
+    if (versionA === undefined && versionB === undefined) continue;
+    if (versionA === undefined) return -1;
+    if (versionB === undefined) return 1;
+    const comparison = semver.compare(versionA, versionB);
+    if (comparison !== 0) return comparison;
+  }
+
+  return 0;
+}
+
+function buildSummary(plan, locked) {
+  const kept = [];
+  const changed = [];
+  const plannedPackages = new Set();
+
+  for (const { package: name, version } of plan) {
+    plannedPackages.add(name);
+    const lockedVersion = locked.has(name) ? locked.get(name) : null;
+    if (lockedVersion === version) {
+      kept.push({ package: name, version });
+    } else {
+      changed.push({ package: name, from: lockedVersion, to: version });
+    }
+  }
+
+  for (const [name, version] of [...locked.entries()].sort((a, b) =>
+    comparePackageNames(a[0], b[0])
+  )) {
+    if (!plannedPackages.has(name)) {
+      changed.push({ package: name, from: version, to: null });
+    }
+  }
+
+  changed.sort((a, b) => comparePackageNames(a.package, b.package));
+
+  return { kept, changed };
+}
+
+function solveUpdatePlan({ catalog, rootRequirements, updateRequirements, locked }) {
+  const seed = [
+    ...rootSeed(rootRequirements),
+    ...rootSeed(updateRequirements),
+  ];
+  const search = createSearch({ catalog, seed });
+
+  let best = null;
+
+  const visit = (state) => {
+    const plan = buildPlan(state.selected);
+    const changes = countTotalChanges(state.selected, locked);
+    if (
+      best === null ||
+      changes < best.changes ||
+      (changes === best.changes && comparePlans(plan, best.plan) > 0)
+    ) {
+      best = { changes, plan };
+    }
+    return null;
+  };
+
+  // A partial selection can never shed changes it has already accumulated,
+  // so branches whose locked-diff count exceeds the best plan cannot win.
+  const prune = (state) =>
+    best !== null && countSelectedChanges(state.selected, locked) > best.changes;
+
+  search.dfs(search.initialState, visit, prune);
+
+  if (best === null) {
+    return search.getFirstConflict();
+  }
+
+  return {
+    satisfiable: true,
+    plan: best.plan,
+    summary: buildSummary(best.plan, locked),
+  };
 }
 
 function resolve(input) {
   return solve(normalizeInput(input));
 }
 
+function planUpdate(input) {
+  return solveUpdatePlan(normalizeUpdatePlanInput(input));
+}
+
 module.exports = {
   ResolutionError,
   normalizeInput,
+  normalizeUpdatePlanInput,
+  planUpdate,
   resolve,
   sourceLabel,
 };

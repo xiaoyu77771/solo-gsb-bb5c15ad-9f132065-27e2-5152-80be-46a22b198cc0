@@ -111,3 +111,86 @@ test('POST /resolve validates malformed requests', async () => {
     server.close();
   }
 });
+
+test('POST /update-plan returns a plan with kept and changed summaries', async () => {
+  const server = await listen(createApp());
+  try {
+    const response = await request(server, '/update-plan', {
+      method: 'POST',
+      body: {
+        registry: {
+          app: { '1.0.0': {} },
+          lib: { '2.1.0': {}, '1.2.0': {} },
+        },
+        root: { app: '1.0.0', lib: '>=1.0.0' },
+        locked: { lib: '1.2.0' },
+        update: { lib: '^2.0.0' },
+      },
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, {
+      satisfiable: true,
+      plan: [
+        { package: 'app', version: '1.0.0' },
+        { package: 'lib', version: '2.1.0' },
+      ],
+      kept: [],
+      changed: [
+        { package: 'app', from: null, to: '1.0.0' },
+        { package: 'lib', from: '1.2.0', to: '2.1.0' },
+      ],
+    });
+  } finally {
+    server.close();
+  }
+});
+
+test('POST /update-plan reports 409 with the shared conflict structure', async () => {
+  const server = await listen(createApp());
+  try {
+    const response = await request(server, '/update-plan', {
+      method: 'POST',
+      body: {
+        registry: { lib: { '1.0.0': {} } },
+        root: {},
+        locked: { lib: '1.0.0' },
+        update: { lib: '^2.0.0' },
+      },
+    });
+
+    assert.equal(response.status, 409);
+    assert.equal(response.body.satisfiable, false);
+    assert.equal(response.body.conflict.package, 'lib');
+    assert.equal(
+      response.body.conflict.chain.at(-1).reasonCode,
+      'NO_VERSION_SATISFIES_CONSTRAINTS'
+    );
+    assert.deepEqual(response.body.conflict.chain.at(-1).requiredBy, {
+      type: 'update',
+    });
+  } finally {
+    server.close();
+  }
+});
+
+test('POST /update-plan rejects invalid locked versions and update ranges', async () => {
+  const server = await listen(createApp());
+  try {
+    const badLocked = await request(server, '/update-plan', {
+      method: 'POST',
+      body: { registry: {}, root: {}, locked: { app: 'not-a-version' }, update: {} },
+    });
+    assert.equal(badLocked.status, 400);
+    assert.equal(badLocked.body.error, 'INVALID_REQUEST');
+
+    const badUpdate = await request(server, '/update-plan', {
+      method: 'POST',
+      body: { registry: {}, root: {}, locked: {}, update: { lib: 'not-a-range' } },
+    });
+    assert.equal(badUpdate.status, 400);
+    assert.equal(badUpdate.body.error, 'INVALID_REQUEST');
+  } finally {
+    server.close();
+  }
+});

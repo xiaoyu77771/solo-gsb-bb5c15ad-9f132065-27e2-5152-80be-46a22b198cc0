@@ -12,6 +12,7 @@ docker compose up --build -d
 
 - 健康检查：`http://localhost:3000/health`
 - 解析接口：`http://localhost:3000/resolve`
+- 更新计划接口：`http://localhost:3000/update-plan`
 
 停止服务：
 
@@ -98,6 +99,68 @@ curl -s -X POST http://localhost:3000/resolve \
 
 `plan` 包含所有根依赖及传递依赖，每个包只选择一个满足全部约束的版本。
 
+### `POST /update-plan`
+
+在 `/resolve` 的基础上根据当前锁定版本计算升级计划。请求体：
+
+- `registry`、`root`：与 `/resolve` 相同。
+- `locked`：当前锁定版本，按“包名 → 版本”组织；版本必须是合法 semver。锁定包可以不在 registry 中（视为可被移除）。
+- `update`：升级约束，按“包名 → semver 范围”组织；与 `root` 一样作为顶层约束生效，可将新包引入计划。
+
+求解目标按优先级依次为：
+
+1. 满足全部 semver 约束（`root`、`update` 及传递依赖约束）；
+2. 相对 `locked` 的变更包数量最少（新增、删除、换版各计 1 次）；
+3. 仍有并列时，按包名字典序逐项比较，优先选择更高版本（包含该包的计划优于不包含的）。
+
+示例：
+
+```bash
+curl -s -X POST http://localhost:3000/update-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "registry": {
+      "app": { "1.0.0": {} },
+      "lib": {
+        "2.1.0": {},
+        "1.2.0": {}
+      }
+    },
+    "root": {
+      "app": "1.0.0",
+      "lib": ">=1.0.0"
+    },
+    "locked": {
+      "lib": "1.2.0"
+    },
+    "update": {
+      "lib": "^2.0.0"
+    }
+  }'
+```
+
+成功时返回 `200`：
+
+```json
+{
+  "satisfiable": true,
+  "plan": [
+    { "package": "app", "version": "1.0.0" },
+    { "package": "lib", "version": "2.1.0" }
+  ],
+  "kept": [],
+  "changed": [
+    { "package": "app", "from": null, "to": "1.0.0" },
+    { "package": "lib", "from": "1.2.0", "to": "2.1.0" }
+  ]
+}
+```
+
+- `kept`：相对 `locked` 未变化的包，按包名字典序。
+- `changed`：新增（`from: null`）、删除（`to: null`）与换版（`from`/`to` 均非空）的包，按包名字典序。
+- 无解时返回 `409 Conflict`，结构与 `/resolve` 相同；由 `update` 引入的约束在冲突链中标记为 `{ "type": "update" }`。
+- `locked` 中的版本或 `update` 中的范围非法时返回 `400 Bad Request`。
+
 ## 解析与稳定性规则
 
 1. 待解析包按包名字典序选择。
@@ -118,7 +181,7 @@ curl -s -X POST http://localhost:3000/resolve \
 
 - 每个沿途包已选定的版本；
 - 该节点收到的 semver 约束；
-- 约束来源（`root` 或哪个包版本引入）；
+- 约束来源（`root`、`update` 或哪个包版本引入）；
 - 无候选包收到的全部约束；
 - registry 中可用版本、满足全部约束的版本列表和机器可读原因码。
 

@@ -12,6 +12,7 @@ class ResolutionError extends Error {
 }
 
 const ROOT_SOURCE = Object.freeze({ type: 'root' });
+const UPDATE_SOURCE = Object.freeze({ type: 'update' });
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -25,7 +26,7 @@ function assertNonEmptyName(name, location) {
 
 function compareSource(a, b) {
   if (a.type !== b.type) return a.type < b.type ? -1 : 1;
-  if (a.type === 'root') return 0;
+  if (a.type === 'root' || a.type === 'update') return 0;
   if (a.package !== b.package) return a.package < b.package ? -1 : 1;
   return semver.compareBuild(a.version, b.version);
 }
@@ -36,6 +37,8 @@ function compareConstraints(a, b) {
 }
 
 function comparePathNodes(a, b) {
+  // Root-level constraints carry empty chains, so both nodes may be absent.
+  if (a.name === undefined && b.name === undefined) return 0;
   if (a.name !== b.name) return a.name < b.name ? -1 : 1;
   const versionResult = semver.compareBuild(a.version, b.version);
   if (versionResult !== 0) return versionResult;
@@ -144,6 +147,7 @@ function normalizeInput(input) {
 
 function serializeSource(source) {
   if (source.type === 'root') return { type: 'root' };
+  if (source.type === 'update') return { type: 'update' };
   return {
     type: 'dependency',
     package: source.package,
@@ -185,9 +189,9 @@ function cloneSelected(selected) {
 }
 
 function sourceLabel(source) {
-  return source.type === 'root'
-    ? 'root'
-    : `${source.package}@${source.version}`;
+  if (source.type === 'root') return 'root';
+  if (source.type === 'update') return 'update';
+  return `${source.package}@${source.version}`;
 }
 
 function choosePrimaryConstraint(entries, chains) {
@@ -265,19 +269,112 @@ function satisfiesAll(version, constraints) {
   return constraints.every(({ range }) => semver.satisfies(version, range));
 }
 
-function solve({ catalog, rootRequirements }) {
+function byName(a, b) {
+  return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
+}
+
+/**
+ * Build the initial solver state from named requirement sets. Each set
+ * contributes one constraint per package, inserted in sorted package-name
+ * order so the state never depends on the caller's key order.
+ */
+function buildInitialState(requirementSets) {
   const constraints = new Map();
   const reasons = new Map();
 
-  // Root requirements are inserted in sorted package-name order.
-  for (const [name, range] of [...rootRequirements.entries()].sort((a, b) =>
-    a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0
-  )) {
-    constraints.set(name, [{ range, source: { ...ROOT_SOURCE } }]);
-    reasons.set(name, [[]]);
+  for (const { requirements, source } of requirementSets) {
+    for (const [name, range] of [...requirements.entries()].sort(byName)) {
+      if (!constraints.has(name)) {
+        constraints.set(name, []);
+        reasons.set(name, []);
+      }
+      constraints.get(name).push({ range, source: { ...source } });
+      reasons.get(name).push([]);
+    }
   }
 
-  const initialState = { constraints, reasons, selected: new Map() };
+  return { constraints, reasons, selected: new Map() };
+}
+
+/**
+ * Select a candidate version for target and propagate its dependencies into
+ * a cloned state. Returns { state } on success or { conflict } when one of
+ * the new dependency ranges contradicts an already selected version.
+ */
+function applyCandidate(state, target, candidate, catalog) {
+  const nextConstraints = cloneConstraints(state.constraints);
+  const nextReasons = cloneReasons(state.reasons);
+  const nextSelected = cloneSelected(state.selected);
+
+  const targetEntries = nextConstraints.get(target);
+  const targetChains = nextReasons.get(target);
+  const primary = choosePrimaryConstraint(targetEntries, targetChains);
+
+  const selectedEntry = {
+    version: candidate.version,
+    range: primary.entry.range,
+    source: { ...primary.entry.source },
+    path: primary.chain.map((node) => ({ ...node, source: { ...node.source } })),
+  };
+  nextSelected.set(target, selectedEntry);
+
+  const pathNode = {
+    name: target,
+    version: candidate.version,
+    range: primary.entry.range,
+    source: { ...primary.entry.source },
+  };
+  const dependencyChain = [...selectedEntry.path, pathNode];
+
+  for (const dependencyName of [...candidate.dependencies.keys()].sort()) {
+    const range = candidate.dependencies.get(dependencyName);
+    const source = {
+      type: 'dependency',
+      package: target,
+      version: candidate.version,
+    };
+    const constraint = { range, source };
+
+    if (!nextConstraints.has(dependencyName)) {
+      nextConstraints.set(dependencyName, []);
+      nextReasons.set(dependencyName, []);
+    }
+
+    nextConstraints.get(dependencyName).push(constraint);
+    nextReasons.get(dependencyName).push(
+      dependencyChain.map((node) => ({ ...node, source: { ...node.source } }))
+    );
+
+    const alreadySelected = nextSelected.get(dependencyName);
+    if (alreadySelected && !semver.satisfies(alreadySelected.version, range)) {
+      return {
+        conflict: buildConflict(
+          dependencyName,
+          {
+            constraints: nextConstraints,
+            reasons: nextReasons,
+            selected: nextSelected,
+          },
+          'SELECTED_VERSION_DOES_NOT_SATISFY_CONSTRAINT',
+          catalog
+        ),
+      };
+    }
+  }
+
+  return {
+    state: {
+      constraints: nextConstraints,
+      reasons: nextReasons,
+      selected: nextSelected,
+    },
+  };
+}
+
+function solve({ catalog, rootRequirements }) {
+  const initialState = buildInitialState([
+    { requirements: rootRequirements, source: ROOT_SOURCE },
+  ]);
   let firstConflict = null;
 
   function recordConflict(conflict) {
@@ -292,7 +389,7 @@ function solve({ catalog, rootRequirements }) {
 
     if (unresolved.length === 0) {
       return [...state.selected.entries()]
-        .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+        .sort(byName)
         .map(([name, entry]) => ({
           package: name,
           version: entry.version,
@@ -314,79 +411,13 @@ function solve({ catalog, rootRequirements }) {
     }
 
     for (const candidate of candidates) {
-      const nextConstraints = cloneConstraints(state.constraints);
-      const nextReasons = cloneReasons(state.reasons);
-      const nextSelected = cloneSelected(state.selected);
-
-      const targetEntries = nextConstraints.get(target);
-      const targetChains = nextReasons.get(target);
-      const primary = choosePrimaryConstraint(targetEntries, targetChains);
-
-      const selectedEntry = {
-        version: candidate.version,
-        range: primary.entry.range,
-        source: { ...primary.entry.source },
-        path: primary.chain.map((node) => ({ ...node, source: { ...node.source } })),
-      };
-      nextSelected.set(target, selectedEntry);
-
-      const pathNode = {
-        name: target,
-        version: candidate.version,
-        range: primary.entry.range,
-        source: { ...primary.entry.source },
-      };
-      const dependencyChain = [...selectedEntry.path, pathNode];
-
-      let selectedConflict = null;
-
-      for (const dependencyName of [...candidate.dependencies.keys()].sort()) {
-        const range = candidate.dependencies.get(dependencyName);
-        const source = {
-          type: 'dependency',
-          package: target,
-          version: candidate.version,
-        };
-        const constraint = { range, source };
-
-        if (!nextConstraints.has(dependencyName)) {
-          nextConstraints.set(dependencyName, []);
-          nextReasons.set(dependencyName, []);
-        }
-
-        nextConstraints.get(dependencyName).push(constraint);
-        nextReasons.get(dependencyName).push(
-          dependencyChain.map((node) => ({ ...node, source: { ...node.source } }))
-        );
-
-        const alreadySelected = nextSelected.get(dependencyName);
-        if (alreadySelected && !semver.satisfies(alreadySelected.version, range)) {
-          selectedConflict = buildConflict(
-            dependencyName,
-            {
-              constraints: nextConstraints,
-              reasons: nextReasons,
-              selected: nextSelected,
-            },
-            'SELECTED_VERSION_DOES_NOT_SATISFY_CONSTRAINT',
-            catalog
-          );
-          break;
-        }
-      }
-
-      if (selectedConflict) {
-        recordConflict(selectedConflict);
+      const result = applyCandidate(state, target, candidate, catalog);
+      if (result.conflict) {
+        recordConflict(result.conflict);
         continue;
       }
 
-      const nextState = {
-        constraints: nextConstraints,
-        reasons: nextReasons,
-        selected: nextSelected,
-      };
-
-      const solution = dfs(nextState);
+      const solution = dfs(result.state);
       if (solution) return solution;
     }
 
@@ -405,13 +436,213 @@ function solve({ catalog, rootRequirements }) {
   return firstConflict;
 }
 
+function normalizeLocked(locked) {
+  if (!isPlainObject(locked)) {
+    throw new ResolutionError('locked must be an object mapping package names to locked versions.');
+  }
+
+  const result = new Map();
+  for (const packageName of Object.keys(locked).sort()) {
+    assertNonEmptyName(packageName, 'locked');
+    const version = locked[packageName];
+    if (typeof version !== 'string' || !semver.valid(version)) {
+      throw new ResolutionError(`locked.${packageName} must be a valid semver version string.`);
+    }
+    result.set(packageName, semver.parse(version).version);
+  }
+  return result;
+}
+
+function normalizeUpdate(update) {
+  if (!isPlainObject(update)) {
+    throw new ResolutionError('update must be an object mapping package names to semver ranges.');
+  }
+
+  const result = new Map();
+  for (const packageName of Object.keys(update).sort()) {
+    assertNonEmptyName(packageName, 'update');
+    const range = update[packageName];
+    if (typeof range !== 'string' || semver.validRange(range) === null) {
+      throw new ResolutionError(`update.${packageName} must be a valid semver range string.`);
+    }
+    result.set(packageName, range);
+  }
+  return result;
+}
+
+/**
+ * Total order over feasible plans: fewer changes relative to locked wins;
+ * ties are broken by walking package names in lexicographic order and
+ * preferring the higher version (a plan that contains the package beats one
+ * that does not). Returns 0 only for identical plans.
+ */
+function comparePlans(a, b) {
+  if (a.changes !== b.changes) return a.changes - b.changes;
+
+  const names = [...new Set([...a.versions.keys(), ...b.versions.keys()])].sort();
+  for (const name of names) {
+    const aVersion = a.versions.get(name);
+    const bVersion = b.versions.get(name);
+    if (aVersion === undefined && bVersion === undefined) continue;
+    if (aVersion === undefined) return 1;
+    if (bVersion === undefined) return -1;
+    const order = semver.compareBuild(aVersion, bVersion);
+    if (order !== 0) return -order;
+  }
+  return 0;
+}
+
+function solveUpdate({ catalog, rootRequirements, updateRequirements, locked }) {
+  const initialState = buildInitialState([
+    { requirements: rootRequirements, source: ROOT_SOURCE },
+    { requirements: updateRequirements, source: UPDATE_SOURCE },
+  ]);
+
+  let firstConflict = null;
+  let best = null;
+
+  function recordConflict(conflict) {
+    if (firstConflict === null) firstConflict = conflict;
+  }
+
+  // Lower bound on the changes any completion of this state still needs.
+  // Selections are final, and every constrained package missing from locked
+  // must appear in the final plan. Locked packages not yet constrained are
+  // not counted: a later selection may still pull them into the plan.
+  function lowerBoundChanges(state) {
+    let count = 0;
+    for (const [name, entry] of state.selected) {
+      if (locked.get(name) !== entry.version) count += 1;
+    }
+    for (const name of state.constraints.keys()) {
+      if (!state.selected.has(name) && !locked.has(name)) count += 1;
+    }
+    return count;
+  }
+
+  function exactChanges(selected) {
+    let count = 0;
+    for (const [name, entry] of selected) {
+      if (locked.get(name) !== entry.version) count += 1;
+    }
+    for (const name of locked.keys()) {
+      if (!selected.has(name)) count += 1;
+    }
+    return count;
+  }
+
+  function dfs(state) {
+    if (best !== null && lowerBoundChanges(state) > best.changes) return;
+
+    const unresolved = [...state.constraints.keys()]
+      .filter((name) => !state.selected.has(name))
+      .sort();
+
+    if (unresolved.length === 0) {
+      const plan = [...state.selected.entries()]
+        .sort(byName)
+        .map(([name, entry]) => ({
+          package: name,
+          version: entry.version,
+        }));
+      const candidate = {
+        plan,
+        changes: exactChanges(state.selected),
+        versions: new Map(plan.map((entry) => [entry.package, entry.version])),
+      };
+      if (best === null || comparePlans(candidate, best) < 0) best = candidate;
+      return;
+    }
+
+    const target = unresolved[0];
+    const targetConstraints = state.constraints.get(target);
+    const availableVersions = catalog.get(target) || [];
+    const candidates = availableVersions.filter((entry) =>
+      satisfiesAll(entry.version, targetConstraints)
+    );
+
+    if (candidates.length === 0) {
+      const reasonCode = availableVersions.length === 0
+        ? 'PACKAGE_NOT_IN_REGISTRY'
+        : 'NO_VERSION_SATISFIES_CONSTRAINTS';
+      recordConflict(buildConflict(target, state, reasonCode, catalog));
+      return;
+    }
+
+    // Try the locked version first so low-change plans are found early; the
+    // remaining candidates keep their descending version order.
+    const lockedVersion = locked.get(target);
+    const ordered = lockedVersion === undefined
+      ? candidates
+      : candidates
+        .filter((entry) => entry.version === lockedVersion)
+        .concat(candidates.filter((entry) => entry.version !== lockedVersion));
+
+    const bound = lowerBoundChanges(state);
+
+    for (const candidate of ordered) {
+      const cost = candidate.version === lockedVersion ? 0 : 1;
+      if (best !== null && bound + cost > best.changes) continue;
+
+      const result = applyCandidate(state, target, candidate, catalog);
+      if (result.conflict) {
+        recordConflict(result.conflict);
+        continue;
+      }
+
+      dfs(result.state);
+    }
+  }
+
+  dfs(initialState);
+
+  if (best === null) return firstConflict;
+
+  const kept = [];
+  const changed = [];
+
+  for (const { package: name, version } of best.plan) {
+    const lockedVersion = locked.get(name);
+    if (lockedVersion === undefined) {
+      changed.push({ package: name, from: null, to: version });
+    } else if (lockedVersion !== version) {
+      changed.push({ package: name, from: lockedVersion, to: version });
+    } else {
+      kept.push({ package: name, version });
+    }
+  }
+
+  for (const [name, lockedVersion] of [...locked.entries()].sort(byName)) {
+    if (!best.versions.has(name)) {
+      changed.push({ package: name, from: lockedVersion, to: null });
+    }
+  }
+
+  changed.sort((a, b) => (a.package < b.package ? -1 : a.package > b.package ? 1 : 0));
+
+  return {
+    satisfiable: true,
+    plan: best.plan,
+    kept,
+    changed,
+  };
+}
+
 function resolve(input) {
   return solve(normalizeInput(input));
+}
+
+function planUpdate(input) {
+  const { catalog, rootRequirements } = normalizeInput(input);
+  const locked = normalizeLocked(input.locked);
+  const updateRequirements = normalizeUpdate(input.update);
+  return solveUpdate({ catalog, rootRequirements, updateRequirements, locked });
 }
 
 module.exports = {
   ResolutionError,
   normalizeInput,
+  planUpdate,
   resolve,
   sourceLabel,
 };

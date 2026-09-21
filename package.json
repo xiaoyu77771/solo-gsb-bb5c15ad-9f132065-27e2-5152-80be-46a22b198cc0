@@ -1,0 +1,19 @@
+{
+  "name": "offline-dependency-resolver",
+  "version": "1.0.0",
+  "description": "Offline semantic-version package dependency resolution API",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "semver": "^7.6.3"
+  },
+  "license": "MIT"
+}

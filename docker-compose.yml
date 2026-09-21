@@ -1,0 +1,25 @@
+services:
+  dependency-resolver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: offline-dependency-resolver:1.0.0
+    container_name: offline-dependency-resolver
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3000
+      JSON_BODY_LIMIT: 1mb
+    ports:
+      - "${HOST_PORT:-3000}:3000"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
